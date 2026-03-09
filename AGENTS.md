@@ -27,7 +27,7 @@ Read before making changes:
 Read and follow:
 
 - [`docs/design/architecture.md`](docs/design/architecture.md) — C4 architecture, domain model, container layout, component structure, and design decisions
-- [`contributing/conventions/code.md`](contributing/conventions/code.md) — naming, comments, type safety, linting, shift-left testing, security
+- [`contributing/conventions/implementation/code.md`](contributing/conventions/implementation/code.md) — naming, comments, type safety, linting, shift-left testing, security
 
 ## When editing agent skill files
 
