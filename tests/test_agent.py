@@ -79,8 +79,61 @@ def test_agent_uses_read_file_for_merge_conflict():
     assert "wiki/" in output.get("source", ""), "Expected source to contain wiki/ reference"
 
 
+def test_agent_uses_query_api_for_item_count():
+    """Test that agent uses query_api tool for database count question."""
+    result = subprocess.run(
+        ["uv", "run", "agent.py", "How many items are in the database?"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    
+    # Check exit code
+    assert result.returncode == 0, f"Agent failed: {result.stderr}"
+    
+    # Parse stdout as JSON
+    output = json.loads(result.stdout)
+    
+    # Check that tool_calls is populated
+    assert len(output["tool_calls"]) > 0, "Expected tool_calls to be populated"
+    
+    # Check that query_api was used
+    tool_names = [tc["tool"] for tc in output["tool_calls"]]
+    assert "query_api" in tool_names, "Expected query_api tool to be used"
+    
+    # Verify the API call was made correctly
+    api_call = next(tc for tc in output["tool_calls"] if tc["tool"] == "query_api")
+    assert api_call["args"]["method"] == "GET", "Expected GET method for query_api"
+    assert "/items" in api_call["args"]["path"], "Expected /items path for query_api"
+
+
+def test_agent_uses_query_api_for_status():
+    """Test that agent uses query_api tool for status question."""
+    result = subprocess.run(
+        ["uv", "run", "agent.py", "What is the API status?"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    
+    # Check exit code
+    assert result.returncode == 0, f"Agent failed: {result.stderr}"
+    
+    # Parse stdout as JSON
+    output = json.loads(result.stdout)
+    
+    # Check that tool_calls is populated
+    assert len(output["tool_calls"]) > 0, "Expected tool_calls to be populated"
+    
+    # Check that query_api was used
+    tool_names = [tc["tool"] for tc in output["tool_calls"]]
+    assert "query_api" in tool_names, "Expected query_api tool to be used"
+
+
 if __name__ == "__main__":
     test_agent_returns_valid_json()
     test_agent_uses_list_files_tool()
     test_agent_uses_read_file_for_merge_conflict()
+    test_agent_uses_query_api_for_item_count()
+    test_agent_uses_query_api_for_status()
     print("All tests passed!")

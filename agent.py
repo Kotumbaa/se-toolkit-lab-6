@@ -23,24 +23,26 @@ from dotenv import load_dotenv
 MAX_ITERATIONS = 10
 
 # System prompt for the agent
-SYSTEM_PROMPT = """You are a documentation assistant for a software engineering lab project.
-You have access to tools that let you read files and list directories in the project wiki.
+SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering lab project.
+
+You have access to these tools:
+1. `list_files` - List files in a directory (use for discovering wiki files)
+2. `read_file` - Read file contents (use for finding information in documentation or source code)
+3. `query_api` - Call the backend HTTP API (use for questions about data, database contents, system status, or API endpoints)
 
 When asked a question:
-1. First use `list_files` to discover relevant wiki files in the 'wiki' directory
-2. Then use `read_file` to read the contents of relevant files
-3. Find the answer in the file contents
-4. Provide the answer with a source reference (file path + section anchor)
+- For documentation questions → use `list_files` then `read_file`
+- For data questions (how many items, what is the score, etc.) → use `query_api`
+- For system questions (what framework, what port) → use `read_file` on source code or `query_api`
 
-Always include the source reference in your final answer. The source should be in the format:
-wiki/filename.md#section-anchor
-
-Section anchors are lowercase with hyphens instead of spaces (e.g., "resolving-merge-conflicts").
+Always include the source reference in your final answer when using wiki files.
+For API queries, mention the endpoint used.
 """
 
 
 def load_env():
-    """Load environment variables from .env.agent.secret."""
+    """Load environment variables from .env.agent.secret and .env.docker.secret."""
+    # Load LLM config from .env.agent.secret
     load_dotenv(".env.agent.secret")
     
     api_key = os.getenv("LLM_API_KEY")
@@ -51,13 +53,24 @@ def load_env():
         print("Error: LLM_API_KEY not set in .env.agent.secret", file=sys.stderr)
         sys.exit(1)
     if not api_base:
-        print("Error: LLM_API_BASE not set in .env.agent.secret", file=sys.stderr)
+        print("Error: LMS_API_BASE not set in .env.agent.secret", file=sys.stderr)
         sys.exit(1)
     if not model:
         print("Error: LLM_MODEL not set in .env.agent.secret", file=sys.stderr)
         sys.exit(1)
     
-    return api_key, api_base, model
+    # Load backend API config from .env.docker.secret
+    load_dotenv(".env.docker.secret", override=True)
+    
+    lms_api_key = os.getenv("LMS_API_KEY")
+    if not lms_api_key:
+        print("Error: LMS_API_KEY not set in .env.docker.secret", file=sys.stderr)
+        sys.exit(1)
+    
+    # Get agent API base URL (optional, defaults to localhost:42002)
+    agent_api_base_url = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
+    
+    return api_key, api_base, model, lms_api_key, agent_api_base_url
 
 
 def validate_path(path: str) -> Path:
@@ -130,19 +143,73 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api(method: str, path: str, body: str = None, api_key: str = None, api_base_url: str = None) -> str:
+    """
+    Call the backend HTTP API.
+    
+    Args:
+        method: HTTP method (GET, POST, etc.)
+        path: API path (e.g., '/items/')
+        body: Optional JSON request body for POST/PUT requests
+        api_key: LMS API key for authentication
+        api_base_url: Base URL of the backend API
+    
+    Returns:
+        JSON string with status_code and body
+    """
+    url = f"{api_base_url}{path}"
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    
+    print(f"Calling API: {method} {url}", file=sys.stderr)
+    
+    try:
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=30.0)
+        elif method.upper() == "POST":
+            response = httpx.post(url, headers=headers, json=json.loads(body) if body else None, timeout=30.0)
+        elif method.upper() == "PUT":
+            response = httpx.put(url, headers=headers, json=json.loads(body) if body else None, timeout=30.0)
+        elif method.upper() == "DELETE":
+            response = httpx.delete(url, headers=headers, timeout=30.0)
+        else:
+            return f"Error: Unsupported method: {method}"
+        
+        result = {
+            "status_code": response.status_code,
+            "body": response.json() if response.content else None
+        }
+        
+        if response.status_code >= 400:
+            print(f"API error: {response.status_code} - {response.text}", file=sys.stderr)
+        
+        return json.dumps(result)
+    except httpx.TimeoutException:
+        return "Error: API request timed out (30s)"
+    except httpx.RequestError as e:
+        return f"Error: Failed to connect to API: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error: Invalid JSON in request body: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # Tool definitions for the LLM (using OpenAI-compatible format)
 TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file from the project repository. Use this to find information in wiki files.",
+            "description": "Read the contents of a file from the project repository. Use this to find information in wiki files or source code.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from project root (e.g., 'wiki/git.md')"
+                        "description": "Relative path from project root (e.g., 'wiki/git.md', 'backend/app/main.py')"
                     }
                 },
                 "required": ["path"],
@@ -160,10 +227,36 @@ TOOL_DEFINITIONS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative directory path from project root (e.g., 'wiki')"
+                        "description": "Relative directory path from project root (e.g., 'wiki', 'backend/app')"
                     }
                 },
                 "required": ["path"],
+                "additionalProperties": False
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend HTTP API to query data or system information. Use this for questions about database contents, item counts, scores, analytics, or system status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, PUT, DELETE)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API path (e.g., '/items/', '/analytics/completion-rate')"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST/PUT requests (e.g., '{\"key\": \"value\"}')"
+                    }
+                },
+                "required": ["method", "path"],
                 "additionalProperties": False
             }
         }
@@ -173,7 +266,7 @@ TOOL_DEFINITIONS = [
 # Tool choice - let the model decide when to use tools
 TOOL_CHOICE = "auto"
 
-# Map tool names to functions
+# Map tool names to functions (query_api is handled separately due to auth)
 TOOL_FUNCTIONS = {
     "read_file": read_file,
     "list_files": list_files,
@@ -225,24 +318,36 @@ def call_llm(messages: list, api_key: str, api_base: str, model: str, tools: lis
     return response.json()
 
 
-def execute_tool(tool_call: dict) -> str:
+def execute_tool(tool_call: dict, lms_api_key: str = None, agent_api_base_url: str = None) -> str:
     """
     Execute a tool call and return the result.
-    
+
     Args:
         tool_call: Dict with 'name' and 'arguments' keys
-    
+        lms_api_key: LMS API key for query_api authentication
+        agent_api_base_url: Base URL for the backend API
+
     Returns:
         Tool result as string
     """
     tool_name = tool_call["function"]["name"]
     arguments = json.loads(tool_call["function"]["arguments"])
-    
+
     print(f"Executing tool: {tool_name} with args: {arguments}", file=sys.stderr)
+
+    # Handle query_api separately since it needs auth credentials
+    if tool_name == "query_api":
+        return query_api(
+            method=arguments.get("method", "GET"),
+            path=arguments.get("path", "/"),
+            body=arguments.get("body"),
+            api_key=lms_api_key,
+            api_base_url=agent_api_base_url
+        )
     
     if tool_name not in TOOL_FUNCTIONS:
         return f"Error: Unknown tool: {tool_name}"
-    
+
     try:
         result = TOOL_FUNCTIONS[tool_name](**arguments)
         return result
@@ -289,16 +394,18 @@ def extract_source(answer: str, tool_calls_log: list) -> str:
     return ""
 
 
-def run_agent(question: str, api_key: str, api_base: str, model: str) -> dict:
+def run_agent(question: str, api_key: str, api_base: str, model: str, lms_api_key: str, agent_api_base_url: str) -> dict:
     """
     Run the agentic loop to answer a question.
-    
+
     Args:
         question: User's question
         api_key: LLM API key
         api_base: LLM API base URL
         model: Model name
-    
+        lms_api_key: LMS API key for query_api authentication
+        agent_api_base_url: Base URL for the backend API
+
     Returns:
         Dict with answer, source, and tool_calls
     """
@@ -307,28 +414,28 @@ def run_agent(question: str, api_key: str, api_base: str, model: str) -> dict:
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": question}
     ]
-    
+
     tool_calls_log = []
-    
+
     for iteration in range(MAX_ITERATIONS):
         print(f"\n--- Iteration {iteration + 1}/{MAX_ITERATIONS} ---", file=sys.stderr)
-        
+
         # Call LLM with current messages and tool definitions
         response = call_llm(messages, api_key, api_base, model, tools=TOOL_DEFINITIONS)
-        
+
         # Get the assistant message
         assistant_message = response["choices"][0]["message"]
-        
+
         # Check for tool calls
         tool_calls = assistant_message.get("tool_calls", [])
 
         if tool_calls:
             # First, add the assistant's message with tool_calls to the conversation
             messages.append(assistant_message)
-            
+
             # Execute each tool call
             for tool_call in tool_calls:
-                result = execute_tool(tool_call)
+                result = execute_tool(tool_call, lms_api_key, agent_api_base_url)
 
                 # Log the tool call
                 tool_calls_log.append({
@@ -372,15 +479,15 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: uv run agent.py \"Your question here\"", file=sys.stderr)
         sys.exit(1)
-    
+
     question = sys.argv[1]
-    
+
     # Load environment variables
-    api_key, api_base, model = load_env()
-    
+    api_key, api_base, model, lms_api_key, agent_api_base_url = load_env()
+
     # Run the agent
-    result = run_agent(question, api_key, api_base, model)
-    
+    result = run_agent(question, api_key, api_base, model, lms_api_key, agent_api_base_url)
+
     # Output JSON to stdout
     print(json.dumps(result))
 
