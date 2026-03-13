@@ -20,23 +20,31 @@ from dotenv import load_dotenv
 
 
 # Maximum number of tool call iterations
-MAX_ITERATIONS = 10
+MAX_ITERATIONS = 25
 
 # System prompt for the agent
 SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering lab project.
 
 You have access to these tools:
-1. `list_files` - List files in a directory (use for discovering wiki files)
+1. `list_files` - List files in a directory (use for discovering wiki files or source code directories)
 2. `read_file` - Read file contents (use for finding information in documentation or source code)
 3. `query_api` - Call the backend HTTP API (use for questions about data, database contents, system status, or API endpoints)
 
 When asked a question:
-- For documentation questions → use `list_files` then `read_file`
+- For documentation questions → use `list_files` then `read_file` in the 'wiki' directory
 - For data questions (how many items, what is the score, etc.) → use `query_api`
-- For system questions (what framework, what port) → use `read_file` on source code or `query_api`
+- For system questions (what framework, what port, what routers) → use `read_file` on source code
+- For backend structure questions → look in 'backend/app' directory (routers are in 'backend/app/routers/')
+
+IMPORTANT RULES:
+1. After gathering information, provide a COMPLETE answer immediately. Do not continue reading files once you have enough information.
+2. When listing multiple items (like routers), list ALL of them in your final answer.
+3. Do not say "Let me check..." - just provide the answer directly.
+4. If you see a list of files, read each one and then summarize ALL of them.
 
 Always include the source reference in your final answer when using wiki files.
 For API queries, mention the endpoint used.
+For source code questions, mention the file path.
 """
 
 
@@ -143,7 +151,7 @@ def list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
-def query_api(method: str, path: str, body: str = None, api_key: str = None, api_base_url: str = None) -> str:
+def query_api(method: str, path: str, body: str = None, auth: bool = True, api_key: str = None, api_base_url: str = None) -> str:
     """
     Call the backend HTTP API.
     
@@ -151,6 +159,7 @@ def query_api(method: str, path: str, body: str = None, api_key: str = None, api
         method: HTTP method (GET, POST, etc.)
         path: API path (e.g., '/items/')
         body: Optional JSON request body for POST/PUT requests
+        auth: Whether to include authentication header (default True)
         api_key: LMS API key for authentication
         api_base_url: Base URL of the backend API
     
@@ -160,9 +169,11 @@ def query_api(method: str, path: str, body: str = None, api_key: str = None, api
     url = f"{api_base_url}{path}"
     
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    
+    if auth and api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     
     print(f"Calling API: {method} {url}", file=sys.stderr)
     
@@ -254,6 +265,10 @@ TOOL_DEFINITIONS = [
                     "body": {
                         "type": "string",
                         "description": "Optional JSON request body for POST/PUT requests (e.g., '{\"key\": \"value\"}')"
+                    },
+                    "auth": {
+                        "type": "boolean",
+                        "description": "Whether to include authentication header (default true). Set to false to test unauthenticated access."
                     }
                 },
                 "required": ["method", "path"],
@@ -341,6 +356,7 @@ def execute_tool(tool_call: dict, lms_api_key: str = None, agent_api_base_url: s
             method=arguments.get("method", "GET"),
             path=arguments.get("path", "/"),
             body=arguments.get("body"),
+            auth=arguments.get("auth", True),
             api_key=lms_api_key,
             api_base_url=agent_api_base_url
         )
