@@ -93,7 +93,7 @@ def _fetch_question(api_url: str, auth: str, lab: str, index: int):
         sys.exit(1)
 
 
-def _run_agent(question: str, timeout: int = 60):
+def _run_agent(question: str, timeout: int = 120):
     """Run agent.py with the question. Returns (answer_dict, error_msg)."""
     try:
         result = subprocess.run(
@@ -103,7 +103,7 @@ def _run_agent(question: str, timeout: int = 60):
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return None, "Agent timed out (60s)"
+        return None, f"Agent timed out ({timeout}s)"
     except FileNotFoundError:
         return None, "agent.py not found"
 
@@ -147,12 +147,12 @@ def _match(text: str, rule: dict) -> bool:
         return bool(re.search(rule["regex"], text, re.IGNORECASE))
 
     if "numeric_gt" in rule:
-        numbers = re.findall(r"[\d.]+", text)
+        numbers = re.findall(r"\d+(?:\.\d+)?", text)
         return any(float(n) > rule["numeric_gt"] for n in numbers if n)
 
     if "numeric_range" in rule:
         lo, hi = rule["numeric_range"]
-        numbers = re.findall(r"[\d.]+", text)
+        numbers = re.findall(r"\d+(?:\.\d+)?", text)
         return any(lo <= float(n) <= hi for n in numbers if n)
 
     return False

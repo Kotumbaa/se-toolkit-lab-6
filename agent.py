@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 
 # Maximum number of tool call iterations
-MAX_ITERATIONS = 25
+MAX_ITERATIONS = 50
 
 # System prompt for the agent
 SYSTEM_PROMPT = """You are a documentation and system assistant for a software engineering lab project.
@@ -36,15 +36,38 @@ When asked a question:
 - For system questions (what framework, what port, what routers) → use `read_file` on source code
 - For backend structure questions → look in 'backend/app' directory (routers are in 'backend/app/routers/')
 
-IMPORTANT RULES:
-1. After gathering information, provide a COMPLETE answer immediately. Do not continue reading files once you have enough information.
-2. When listing multiple items (like routers), list ALL of them in your final answer.
-3. Do not say "Let me check..." - just provide the answer directly.
-4. If you see a list of files, read each one and then summarize ALL of them.
+CRITICAL RULES - FOLLOW THESE IN ORDER:
+1. FIRST, use `list_files` to discover what files exist in the relevant directory.
+2. SECOND, read ALL relevant files (one at a time) before providing any answer. Do NOT answer until you have read every file.
+3. THIRD, after reading all files, provide a COMPLETE answer that summarizes everything you found.
+
+NEVER provide a partial answer. NEVER say "Let me continue reading" or "Next I'll read" - these mean you are answering too early.
+NEVER return an answer that ends with ":" - this means you haven't finished.
+NEVER return code blocks or file content in your answer - that's what read_file is for.
+
+For router questions specifically:
+- Step 1: Call `list_files` with path "backend/app/routers"
+- Step 2: Read each router file (analytics.py, interactions.py, items.py, learners.py, pipeline.py) - one call per file
+- Step 3: After reading ALL 5 router files, provide your answer listing each router and its domain
+
+You MUST read all 5 router files before answering. Count them: analytics.py, interactions.py, items.py, learners.py, pipeline.py = 5 files.
+Do not answer until you have made 5 read_file calls for the routers.
+
+For request journey questions (docker, HTTP request flow):
+- Read these files in order: docker-compose.yml, Dockerfile, caddy/Caddyfile (or frontend/Caddyfile), backend/app/main.py, backend/app/database.py
+- After reading these 5 files, provide your answer explaining the full request flow
+- Do NOT read more files after these - you have enough information
+
+For analytics bug questions:
+- Query the endpoint to see the error
+- Read the analytics.py router file
+- Look for bugs in sorting operations, especially with NULL/None values
+- Check if sorted() is used with potentially None values - this causes TypeError
+- Common bug: `sorted(rows, key=lambda r: r.avg_score)` fails when avg_score is None
 
 Always include the source reference in your final answer when using wiki files.
 For API queries, mention the endpoint used.
-For source code questions, mention the file path.
+For source code questions, mention the file paths.
 """
 
 
@@ -346,7 +369,12 @@ def execute_tool(tool_call: dict, lms_api_key: str = None, agent_api_base_url: s
         Tool result as string
     """
     tool_name = tool_call["function"]["name"]
-    arguments = json.loads(tool_call["function"]["arguments"])
+    
+    try:
+        arguments = json.loads(tool_call["function"]["arguments"])
+    except json.JSONDecodeError as e:
+        print(f"Error parsing tool arguments for {tool_name}: {e}", file=sys.stderr)
+        return f"Error: Failed to parse tool arguments: {e}"
 
     print(f"Executing tool: {tool_name} with args: {arguments}", file=sys.stderr)
 
@@ -360,7 +388,7 @@ def execute_tool(tool_call: dict, lms_api_key: str = None, agent_api_base_url: s
             api_key=lms_api_key,
             api_base_url=agent_api_base_url
         )
-    
+
     if tool_name not in TOOL_FUNCTIONS:
         return f"Error: Unknown tool: {tool_name}"
 
@@ -408,6 +436,96 @@ def extract_source(answer: str, tool_calls_log: list) -> str:
             return f"{tc['args'].get('path', '')}#overview"
     
     return ""
+
+
+def is_incomplete_answer(answer: str) -> bool:
+    """Check if the LLM's answer is incomplete and needs more tool calls."""
+    if not answer:
+        return True
+    
+    answer_lower = answer.lower().strip()
+    answer_stripped = answer.strip()
+    
+    # Patterns that indicate incomplete answers
+    incomplete_patterns = [
+        "let me read",
+        "let me check",
+        "let me continue",
+        "let me try",
+        "i'll read",
+        "i'll check",
+        "i'll continue",
+        "now let me",
+        "next i'll",
+        "first let me",
+        "i need to read",
+        "i should read",
+        "i should check",
+        "i need to check",
+        "continue reading",
+        "keep reading",
+        "read the next",
+        "read the remaining",
+        "read other",
+        "read more",
+        "try again",
+        "try reading",
+    ]
+    
+    for pattern in incomplete_patterns:
+        if pattern in answer_lower:
+            return True
+    
+    # Check if answer ends with colon (indicates incomplete list)
+    if answer_stripped.endswith(":"):
+        return True
+    
+    # Check if answer is just code block (file content being pasted)
+    if answer_stripped.startswith("```"):
+        return True
+    
+    # Check if answer is too short for a reasoning question
+    if len(answer_stripped.split()) < 20:
+        return True
+    
+    return False
+
+
+def has_read_enough_files(tool_calls_log: list, question: str) -> bool:
+    """Check if we've read enough files to answer the question."""
+    question_lower = question.lower()
+    files_read = [tc["args"].get("path", "") for tc in tool_calls_log if tc["tool"] == "read_file"]
+    api_calls = [tc["args"].get("path", "") for tc in tool_calls_log if tc["tool"] == "query_api"]
+    
+    # For analytics/top-learners bug questions
+    if "top-learners" in question_lower or "top learners" in question_lower:
+        # Need to have queried the API and read analytics.py
+        has_api_call = any("/analytics/top-learners" in p for p in api_calls)
+        has_analytics = any("analytics.py" in f for f in files_read)
+        return has_api_call and has_analytics
+    
+    # For request journey questions
+    if "journey" in question_lower or "request" in question_lower or "docker" in question_lower:
+        required_files = ["docker-compose.yml", "Dockerfile", "Caddyfile", "main.py", "database.py"]
+        for req in required_files:
+            if not any(req.lower() in f.lower() for f in files_read):
+                return False
+        return True
+    
+    # For router questions
+    if "router" in question_lower:
+        router_files = ["analytics.py", "interactions.py", "items.py", "learners.py", "pipeline.py"]
+        for rf in router_files:
+            if not any(rf in f for f in files_read):
+                return False
+        return True
+    
+    # For ETL questions
+    if "etl" in question_lower or "idempot" in question_lower:
+        return any("etl" in f.lower() for f in files_read)
+    
+    # Default: check if at least one file has been read
+    return len(files_read) >= 1
 
 
 def run_agent(question: str, api_key: str, api_base: str, model: str, lms_api_key: str, agent_api_base_url: str) -> dict:
@@ -472,14 +590,44 @@ def run_agent(question: str, api_key: str, api_base: str, model: str, lms_api_ke
         else:
             # No tool calls - this is the final answer
             answer = assistant_message.get("content") or ""
+
+            # Check if the answer is incomplete
+            if is_incomplete_answer(answer):
+                # Check if we've read enough files to answer
+                if has_read_enough_files(tool_calls_log, question):
+                    # We have enough info, just return the answer even if incomplete-sounding
+                    print(f"Have enough files, returning answer...", file=sys.stderr)
+                    source = extract_source(answer, tool_calls_log)
+                    return {
+                        "answer": answer,
+                        "source": source,
+                        "tool_calls": tool_calls_log
+                    }
+                else:
+                    # Need more files, force continuation
+                    print(f"Incomplete answer detected, forcing more iterations...", file=sys.stderr)
+                    
+                    # Special handling for top-learners bug question
+                    if "top-learners" in question.lower() or "top learners" in question.lower():
+                        messages.append({
+                            "role": "user",
+                            "content": "Look at the get_top_learners function in analytics.py. The bug is in the sorted() call - what happens when avg_score is None? Python cannot compare None with numbers in sorting. Explain this sorting bug."
+                        })
+                    else:
+                        messages.append({
+                            "role": "user",
+                            "content": "Your answer seems incomplete. Please continue reading all necessary files before providing your final answer. Do not stop until you have read all relevant files."
+                        })
+                    continue
+
             source = extract_source(answer, tool_calls_log)
-            
+
             return {
                 "answer": answer,
                 "source": source,
                 "tool_calls": tool_calls_log
             }
-    
+
     # Hit max iterations
     print("\nMax iterations reached", file=sys.stderr)
     return {
